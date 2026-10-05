@@ -7,6 +7,7 @@
     "dev": "nuxt dev --host 0.0.0.0 --port 62028",
     "build": "nuxt build",
     "preview": "nuxt preview --host 0.0.0.0 --port 62028",
+    "test": "tsx --tsconfig tsconfig.test.json tests/trial-store.test.ts",
     "postinstall": "nuxt prepare"
   },
   "dependencies": {
@@ -24,6 +25,7 @@
     "zod": "^3.25.76"
   },
   "devDependencies": {
+    "tsx": "^4.23.15",
     "typescript": "^5.9.3",
     "vue-tsc": "^3.1.0"
   }

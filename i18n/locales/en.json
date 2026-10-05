@@ -1,8 +1,9 @@
 {
   "title": "Multinational Trial Randomization Desk",
-  "subtitle": "Stratified randomization, role isolation, safe unblinding and pending queue",
+  "subtitle": "Stratified randomization, role isolation, controlled unblinding and pending queue",
   "randomize": "Randomize",
   "participants": "Participants",
   "audit": "Safety audit",
-  "pending": "Pending queue"
+  "pending": "Pending queue",
+  "ledger": "Unblinding ledger"
 }

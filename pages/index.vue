@@ -6,11 +6,11 @@ import { useForm } from 'vee-validate';
 import { z } from 'zod';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { useTrialStore } from '~/stores/trial';
-import type { TrialRole } from '~/types/trial';
+import type { Participant, TrialRole } from '~/types/trial';
 
 const { t } = useI18n();
 const trial = useTrialStore();
-const { participants, audits, pending } = storeToRefs(trial);
+const { participants, audits, pending, unblindings, debugFailPersist } = storeToRefs(trial);
 const role = ref<TrialRole>('investigator');
 const offline = ref(false);
 const schema = toTypedSchema(z.object({
@@ -27,10 +27,18 @@ const [site] = defineField('site');
 const [ageBand] = defineField('ageBand');
 const [actor] = defineField('actor');
 
-const visibleArm = (arm?: 'A' | 'B', status?: string) => {
-  if (role.value === 'pharmacist') return arm ?? '待分配';
-  if (role.value === 'monitor' && status === 'unblinded') return arm ?? '未知';
+/** 受控披露：药品管理员按角色边界永不可见组别；其余角色也仅能看到已揭盲受试者本人的组别 */
+const visibleArm = (row: Participant) => {
+  if (role.value === 'pharmacist') return '已隐藏';
+  if (row.status === 'unblinded') return row.arm ?? '未知';
   return '已隐藏';
+};
+
+/** 存在生效中揭盲的区组：同区组其他受试者的发药编号一并遮蔽，防止由配对关系反推组别 */
+const hotBlocks = computed(() => new Set(participants.value.filter((item) => item.status === 'unblinded').map((item) => item.blockId)));
+const visibleKit = (row: Participant) => {
+  if (row.status !== 'unblinded' && hotBlocks.value.has(row.blockId)) return '已保护';
+  return row.kitNo;
 };
 
 const submit = handleSubmit((values) => {
@@ -44,10 +52,43 @@ const submit = handleSubmit((values) => {
 });
 
 const unblind = async (id: string, participantNumber: string) => {
+  const operator = actor.value?.trim();
+  if (!operator) {
+    ElMessage.error('请先在左侧表单填写操作人，揭盲必须署名');
+    return;
+  }
+  let reason: string;
   try {
-    const { value } = await ElMessageBox.prompt(`为 ${participantNumber} 填写紧急揭盲原因`, '紧急揭盲', { inputType: 'textarea', inputValidator: (value) => Boolean(value?.trim()) || '揭盲原因不能为空', confirmButtonText: '确认并审计' });
-    trial.emergencyUnblind(id, value, actor.value);
-    ElMessage.warning('已揭盲，审计记录已追加');
+    const { value } = await ElMessageBox.prompt(`为 ${participantNumber} 填写紧急揭盲原因（仅披露该受试者治疗组）`, '紧急揭盲 · 受控披露', { inputType: 'textarea', inputValidator: (value) => Boolean(value?.trim()) || '揭盲原因不能为空', confirmButtonText: '确认并审计' });
+    reason = value;
+  } catch { return; }
+  // 一次申请固定一个申请编号：写盘失败按原编号重试，不会重复记账
+  const requestId = `UB-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+  let result = trial.requestUnblind({ requestId, participantId: id, reason, actor: operator });
+  while (!result.ok && result.retryable) {
+    try {
+      await ElMessageBox.confirm(`写入失败，本次未记账。是否按申请编号 ${requestId} 重试？`, '揭盲写入失败', { confirmButtonText: '按原申请编号重试', cancelButtonText: '放弃', type: 'error' });
+    } catch {
+      ElMessage.info(`已放弃，申请 ${requestId} 未记账`);
+      return;
+    }
+    result = trial.requestUnblind({ requestId, participantId: id, reason, actor: operator });
+  }
+  if (result.ok) ElMessage.warning(result.message);
+  else ElMessage.error(result.message);
+};
+
+const restore = async (id: string, participantNumber: string) => {
+  const operator = actor.value?.trim();
+  if (!operator) {
+    ElMessage.error('请先在左侧表单填写操作人，恢复盲态必须署名');
+    return;
+  }
+  try {
+    const { value } = await ElMessageBox.prompt(`为 ${participantNumber} 填写恢复盲态原因（撤回 / 核查不成立）`, '恢复盲态', { inputType: 'textarea', inputValidator: (value) => Boolean(value?.trim()) || '原因不能为空', confirmButtonText: '确认恢复并审计' });
+    const result = trial.restoreBlind({ participantId: id, reason: value, actor: operator });
+    if (result.ok) ElMessage.success(result.message);
+    else ElMessage.error(result.message);
   } catch {}
 };
 
@@ -89,11 +130,15 @@ const counts = computed(() => ({
       <el-card shadow="never">
         <template #header><div style="display:flex;justify-content:space-between"><b>{{ t('participants') }}</b><el-tag>{{ role }}</el-tag></div></template>
         <el-table :data="participants" max-height="480">
-          <el-table-column prop="participantNo" label="受试者" min-width="110" />
-          <el-table-column prop="site" label="中心" min-width="110" />
-          <el-table-column prop="sequence" label="随机号" width="90" />
-          <el-table-column label="治疗组" width="100"><template #default="{ row }"><el-tag :type="row.status === 'unblinded' ? 'danger' : 'info'">{{ visibleArm(row.arm, row.status) }}</el-tag></template></el-table-column>
-          <el-table-column label="操作" width="100"><template #default="{ row }"><el-button v-if="role === 'investigator'" size="small" type="danger" plain @click="unblind(row.id, row.participantNo)">揭盲</el-button></template></el-table-column>
+          <el-table-column prop="participantNo" label="受试者" min-width="100" />
+          <el-table-column prop="site" label="中心" min-width="100" />
+          <el-table-column label="区组" width="70"><template #default="{ row }">{{ (row as Participant).blockId.split('|').pop() }}</template></el-table-column>
+          <el-table-column label="发药编号" width="110"><template #default="{ row }"><el-tag :type="visibleKit(row as Participant) === '已保护' ? 'warning' : 'info'">{{ visibleKit(row as Participant) }}</el-tag></template></el-table-column>
+          <el-table-column label="治疗组" width="100"><template #default="{ row }"><el-tag :type="row.status === 'unblinded' ? 'danger' : 'info'">{{ visibleArm(row as Participant) }}</el-tag></template></el-table-column>
+          <el-table-column label="操作" width="130"><template #default="{ row }">
+            <el-button v-if="role === 'investigator' && row.status !== 'unblinded'" size="small" type="danger" plain @click="unblind(row.id, row.participantNo)">揭盲</el-button>
+            <el-button v-if="role !== 'pharmacist' && row.status === 'unblinded'" size="small" type="success" plain @click="restore(row.id, row.participantNo)">恢复盲态</el-button>
+          </template></el-table-column>
         </el-table>
       </el-card>
     </div>
@@ -105,18 +150,31 @@ const counts = computed(() => ({
         <el-table v-else :data="pending">
           <el-table-column prop="payload.participantNo" label="受试者" />
           <el-table-column prop="status" label="状态" />
-          <el-table-column label="操作"><template #default="{ row }"><el-button :disabled="row.status !== 'pending'" size="small" type="primary" @click="trial.commitPending(row.id, actor)">确认入库</el-button></template></el-table-column>
+          <el-table-column label="操作"><template #default="{ row }"><el-button :disabled="row.status !== 'pending'" size="small" type="primary" @click="trial.commitPending(row.id, actor ?? '')">确认入库</el-button></template></el-table-column>
         </el-table>
       </el-card>
       <el-card shadow="never">
-        <template #header><b>{{ t('audit') }}</b><el-tag type="warning" style="float:right">仅追加</el-tag></template>
-        <el-timeline>
-          <el-timeline-item v-for="entry in audits" :key="entry.id" :timestamp="new Date(entry.at).toLocaleString()" :type="entry.action === 'unblinded' ? 'danger' : entry.action === 'duplicate-blocked' ? 'warning' : 'primary'">
-            <b>{{ entry.actor }} · {{ entry.action }}</b><div>{{ entry.detail }}</div>
-          </el-timeline-item>
-        </el-timeline>
+        <template #header><b>{{ t('ledger') }}</b><el-switch v-model="debugFailPersist" active-text="模拟写盘失败" style="float:right;margin-left:12px" /><el-tag type="warning" style="float:right">仅追加</el-tag></template>
+        <el-empty v-if="unblindings.length === 0" description="暂无揭盲记录" />
+        <el-table v-else :data="unblindings" max-height="300">
+          <el-table-column prop="requestId" label="申请编号" width="130" />
+          <el-table-column prop="participantNo" label="受试者" width="90" />
+          <el-table-column label="事件" width="100"><template #default="{ row }"><el-tag :type="row.kind === 'disclose' ? 'danger' : 'success'">{{ row.kind === 'disclose' ? '受控披露' : '恢复盲态' }}</el-tag></template></el-table-column>
+          <el-table-column prop="reason" label="原因" min-width="160" show-overflow-tooltip />
+          <el-table-column prop="actor" label="操作人" width="110" />
+          <el-table-column label="关联申请" width="130"><template #default="{ row }">{{ row.reversesRequestId ?? '—' }}</template></el-table-column>
+        </el-table>
       </el-card>
     </div>
+
+    <el-card shadow="never" style="margin-top:20px">
+      <template #header><b>{{ t('audit') }}</b><el-tag type="warning" style="float:right">仅追加</el-tag></template>
+      <el-timeline>
+        <el-timeline-item v-for="entry in audits" :key="entry.id" :timestamp="new Date(entry.at).toLocaleString()" :type="entry.action === 'unblinded' ? 'danger' : entry.action === 'blind-restored' ? 'success' : entry.action === 'duplicate-blocked' ? 'warning' : 'primary'">
+          <b>{{ entry.actor }} · {{ entry.action }}</b><div>{{ entry.detail }}</div>
+        </el-timeline-item>
+      </el-timeline>
+    </el-card>
   </main>
 </template>
 

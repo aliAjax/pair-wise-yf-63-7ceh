@@ -4,6 +4,13 @@ export function readLocal<T>(key: string, fallback: T): T {
   return raw ? JSON.parse(raw) as T : fallback;
 }
 
-export function writeLocal<T>(key: string, value: T) {
-  if (import.meta.client) localStorage.setItem(key, JSON.stringify(value));
+/** 写盘成功返回 true；失败（如配额超限）返回 false，由调用方回滚并允许按申请编号重试。 */
+export function writeLocal<T>(key: string, value: T): boolean {
+  if (!import.meta.client) return true;
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+    return true;
+  } catch {
+    return false;
+  }
 }
